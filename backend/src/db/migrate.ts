@@ -1,6 +1,7 @@
 import pool from './pool';
 import { messages } from '../constants/messages';
 import { logger } from '../utils/logger';
+import { reallocateVolunteerDays, rebuildServicePointsLogs, reconcileVolunteerAggregates } from '../services/dailyCapService';
 
 const createTables = async (): Promise<void> => {
   const client = await pool.connect();
@@ -40,6 +41,14 @@ const createTables = async (): Promise<void> => {
         is_no_show BOOLEAN NOT NULL DEFAULT false,
         location VARCHAR(200),
         description TEXT,
+        valid_hours DECIMAL(6,2) NOT NULL DEFAULT 0,
+        overtime_hours DECIMAL(6,2) NOT NULL DEFAULT 0,
+        status VARCHAR(20) NOT NULL DEFAULT 'valid'
+          CHECK (status IN ('valid', 'overtime', 'no_show', 'revoked')),
+        cap_seq BIGINT,
+        revoked_at TIMESTAMP,
+        revoked_by VARCHAR(100),
+        revoke_reason TEXT,
         recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -48,6 +57,53 @@ const createTables = async (): Promise<void> => {
       CREATE INDEX IF NOT EXISTS idx_service_records_volunteer_id ON service_records(volunteer_id);
       CREATE INDEX IF NOT EXISTS idx_service_records_recorded_at ON service_records(recorded_at DESC);
       CREATE INDEX IF NOT EXISTS idx_service_records_service_type ON service_records(service_type);
+      CREATE INDEX IF NOT EXISTS idx_service_records_status ON service_records(status);
+      CREATE INDEX IF NOT EXISTS idx_service_records_volunteer_day_seq
+        ON service_records(volunteer_id, recorded_at, cap_seq);
+    `);
+
+    // 兼容旧库：补齐每日工时上限相关列
+    await client.query(`
+      ALTER TABLE service_records ADD COLUMN IF NOT EXISTS valid_hours DECIMAL(6,2) NOT NULL DEFAULT 0;
+      ALTER TABLE service_records ADD COLUMN IF NOT EXISTS overtime_hours DECIMAL(6,2) NOT NULL DEFAULT 0;
+      ALTER TABLE service_records ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'valid';
+      ALTER TABLE service_records ADD COLUMN IF NOT EXISTS cap_seq BIGINT;
+      ALTER TABLE service_records ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP;
+      ALTER TABLE service_records ADD COLUMN IF NOT EXISTS revoked_by VARCHAR(100);
+      ALTER TABLE service_records ADD COLUMN IF NOT EXISTS revoke_reason TEXT;
+
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'service_records_status_check'
+        ) THEN
+          ALTER TABLE service_records
+            ADD CONSTRAINT service_records_status_check
+            CHECK (status IN ('valid', 'overtime', 'no_show', 'revoked'));
+        END IF;
+      END $$;
+
+      CREATE INDEX IF NOT EXISTS idx_service_records_status ON service_records(status);
+      CREATE INDEX IF NOT EXISTS idx_service_records_volunteer_day_seq
+        ON service_records(volunteer_id, recorded_at, cap_seq);
+
+      UPDATE service_records SET status = 'no_show' WHERE is_no_show = true AND status = 'valid';
+
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'service_records_cap_seq_global') THEN
+          CREATE SEQUENCE service_records_cap_seq_global;
+        END IF;
+      END $$;
+
+      ALTER TABLE service_records
+        ALTER COLUMN cap_seq SET DEFAULT nextval('service_records_cap_seq_global');
+
+      SELECT setval(
+        'service_records_cap_seq_global',
+        GREATEST(COALESCE((SELECT MAX(cap_seq) FROM service_records), 0), 1),
+        true
+      );
     `);
 
     await client.query(`
@@ -197,4 +253,67 @@ const seedData = async (): Promise<void> => {
   }
 };
 
-export { createTables, seedData };
+/**
+ * 一次性回填：为存量服务记录补齐当天顺序号（cap_seq），
+ * 再按每人每天 8 小时上限重算有效/超额工时、积分流水、积分/等级/徽章/服务次数。
+ */
+const backfillDailyCap = async (): Promise<void> => {
+  const client = await pool.connect();
+
+  try {
+    const flagResult = await client.query(
+      `SELECT value FROM app_metadata WHERE key = 'daily_cap_initialized'`
+    );
+    if (flagResult.rows.length > 0 && flagResult.rows[0].value === 'v1') {
+      return;
+    }
+
+    await client.query('BEGIN');
+
+    // 同一人同一天按录入先后编号；旧记录没有独立的日序号，用 recorded_at 近似
+    await client.query(`
+      DO $$
+      DECLARE
+        rec RECORD;
+        day_seq BIGINT;
+      BEGIN
+        day_seq := 0;
+        FOR rec IN
+          SELECT id, volunteer_id, recorded_at::date AS record_date
+          FROM service_records
+          WHERE cap_seq IS NULL
+          ORDER BY volunteer_id, recorded_at::date, recorded_at ASC, created_at ASC
+        LOOP
+          day_seq := nextval('service_records_cap_seq_global');
+          UPDATE service_records SET cap_seq = day_seq WHERE id = rec.id;
+        END LOOP;
+      END $$;
+    `);
+
+    // 后续新插入自动生成当天顺序号（序列与默认值已在建表迁移中创建）
+
+    const volunteersResult = await client.query('SELECT id FROM volunteers ORDER BY created_at');
+    for (const row of volunteersResult.rows) {
+      await reallocateVolunteerDays(client, row.id);
+      await rebuildServicePointsLogs(client, row.id);
+      await reconcileVolunteerAggregates(client, row.id);
+    }
+
+    await client.query(
+      `INSERT INTO app_metadata (key, value)
+       VALUES ('daily_cap_initialized', 'v1')
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`
+    );
+
+    await client.query('COMMIT');
+    logger.info('Daily working-hours cap backfill completed.');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Daily working-hours cap backfill failed', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+export { createTables, seedData, backfillDailyCap };

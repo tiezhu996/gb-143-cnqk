@@ -21,6 +21,7 @@ export const badgeLevels = [
 export const serviceRules = {
   pointsPerHour: 10,
   creditLimitThreshold: 30,
+  dailyValidHoursLimit: 8,
 };
 
 export const apiEndpoints = [
@@ -32,8 +33,11 @@ export const apiEndpoints = [
   'GET  /api/v1/volunteers/:id/badges - 徽章列表',
   'GET  /api/v1/volunteers/:id/points-logs - 积分明细',
   'GET  /api/v1/volunteers/:id/credit-logs - 信用明细',
-  'POST /api/v1/service-records - 创建服务记录',
-  'POST /api/v1/service-records/batch - 批量导入',
+  'POST /api/v1/service-records - 创建服务记录（每人每天有效工时上限8小时，超额部分不计积分/次数/信用）',
+  'POST /api/v1/service-records/batch - 批量导入（同样按当天顺序应用8小时上限）',
+  'GET /api/v1/service-records/volunteer/:volunteerId - 服务记录列表（含有效工时、超额工时、每日重算结果，可按 status/record_date 过滤）',
+  'GET /api/v1/service-records/:id - 服务记录详情（含当天工时上限使用情况）',
+  'DELETE /api/v1/service-records/:id - 撤销记录（保留原记录，后续记录有效工时按当天顺序补回并重算积分/等级/徽章/信用）',
   'GET  /api/v1/ranking/points - 积分排行榜',
   'GET  /api/v1/ranking/credit - 信用排行榜',
   'GET  /api/v1/ranking/trend - 趋势数据',

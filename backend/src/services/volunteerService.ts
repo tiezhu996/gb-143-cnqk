@@ -1,19 +1,33 @@
-import { Volunteer, ServiceRecord, PointsLog, ApiResponse, CreateServiceRecordResult } from '../types';
+import { Volunteer, ServiceRecord, ApiResponse, CreateServiceRecordResult } from '../types';
 import pool from '../db/pool';
-import { calculatePoints, calculateNoShowPenalty } from './pointsCalculator';
-import { calculateLevel, checkNewBadges } from './badgeService';
-import { logCreditChange, isCreditLimited, CREDIT_LIMIT_THRESHOLD, recalculateCreditScore } from './creditService';
+import { calculateNoShowPenalty } from './pointsCalculator';
+import {
+  isCreditLimited,
+  CREDIT_LIMIT_THRESHOLD,
+  recalculateCreditScore,
+  logCreditChange,
+} from './creditService';
+import {
+  reallocateVolunteerDays,
+  rebuildServicePointsLogs,
+  reconcileVolunteerAggregates,
+  getVolunteerDayCapSummary,
+  RecordCapChange,
+} from './dailyCapService';
+import { DAILY_VALID_HOURS_LIMIT, round2, toRecordDate } from './dailyCapAllocation';
 import { logger } from '../utils/logger';
 import { messages } from '../constants/messages';
 
-export const createServiceRecord = async (record: ServiceRecord): Promise<ApiResponse<CreateServiceRecordResult>> => {
+export const createServiceRecord = async (
+  record: ServiceRecord
+): Promise<ApiResponse<CreateServiceRecordResult>> => {
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
     const volunteerResult = await client.query(
-      'SELECT * FROM volunteers WHERE id = $1',
+      'SELECT * FROM volunteers WHERE id = $1 FOR UPDATE',
       [record.volunteer_id]
     );
 
@@ -37,72 +51,58 @@ export const createServiceRecord = async (record: ServiceRecord): Promise<ApiRes
       };
     }
 
-    const pointsEarned = record.is_no_show ? 0 : calculatePoints(
-      record.duration_hours,
-      record.service_type,
-      record.rating
-    );
+    const isNoShow = record.is_no_show || false;
+    const recordDate = toRecordDate(record.recorded_at);
 
     const insertResult = await client.query(
       `INSERT INTO service_records
-       (volunteer_id, service_type, duration_hours, rating, points_earned, is_no_show, location, description)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (volunteer_id, service_type, duration_hours, rating, points_earned, is_no_show,
+        location, description, recorded_at, valid_hours, overtime_hours, status)
+       VALUES ($1, $2, $3, $4, 0, $5, $6, $7, COALESCE($8, CURRENT_TIMESTAMP), 0, 0,
+               CASE WHEN $5 THEN 'no_show' ELSE 'valid' END)
        RETURNING *`,
       [
         record.volunteer_id,
         record.service_type,
         record.duration_hours,
         record.rating,
-        pointsEarned,
-        record.is_no_show || false,
+        isNoShow,
         record.location,
         record.description,
+        record.recorded_at || null,
       ]
     );
 
-    const newRecord = insertResult.rows[0];
+    const insertedRow = insertResult.rows[0] as ServiceRecord;
 
-    let pointsChange = pointsEarned;
-    if (record.is_no_show) {
-      pointsChange = -calculateNoShowPenalty();
-    }
+    // 统一走“按记录日期 + 当天顺序”的重算引擎：
+    // 即使是往已有记录的日期补录更早时间的记录，也会正确重排当天有效/超额工时
+    const changes = await reallocateVolunteerDays(client, volunteer.id, [recordDate]);
+    const thisChange = changes.find(change => change.record.id === insertedRow.id);
+    const cap = thisChange
+      ? {
+          validHours: thisChange.after.valid_hours,
+          overtimeHours: thisChange.after.overtime_hours,
+          pointsEarned: thisChange.after.points_earned,
+          status: thisChange.after.status,
+        }
+      : {
+          validHours: Number(insertedRow.valid_hours ?? 0),
+          overtimeHours: Number(insertedRow.overtime_hours ?? 0),
+          pointsEarned: Number(insertedRow.points_earned ?? 0),
+          status: (insertedRow.status ?? 'valid') as ServiceRecord['status'],
+        };
 
-    const oldTotalPoints = volunteer.total_points;
-    const newTotalPoints = Math.max(0, oldTotalPoints + pointsChange);
-    const oldLevel = volunteer.level;
-    const newLevel = calculateLevel(newTotalPoints);
-
-    await client.query(
-      `UPDATE volunteers
-       SET total_points = $1,
-           level = $2,
-           service_count = service_count + $3
-       WHERE id = $4`,
-      [newTotalPoints, newLevel, record.is_no_show ? 0 : 1, volunteer.id]
+    const newRecordResult = await client.query(
+      'SELECT * FROM service_records WHERE id = $1',
+      [insertedRow.id]
     );
+    const newRecord = newRecordResult.rows[0] as ServiceRecord;
 
-    await client.query(
-      `INSERT INTO points_logs (volunteer_id, change_amount, reason, before_points, after_points, related_id, related_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        volunteer.id,
-        pointsChange,
-        record.is_no_show ? '爽约扣分' : `服务积分: ${record.service_type}`,
-        oldTotalPoints,
-        newTotalPoints,
-        newRecord.id,
-        'service_record',
-      ]
-    );
+    await rebuildServicePointsLogs(client, volunteer.id);
+    const aggregates = await reconcileVolunteerAggregates(client, volunteer.id);
 
-    let newBadges: any[] = [];
-    if (newLevel > oldLevel) {
-      const currentBadges = await client.query(
-        'SELECT * FROM badges WHERE volunteer_id = $1',
-        [volunteer.id]
-      );
-      newBadges = await checkNewBadges(volunteer.id, newLevel, currentBadges.rows);
-    }
+    const pointsChange = isNoShow ? -calculateNoShowPenalty() : cap.pointsEarned;
 
     await client.query('COMMIT');
 
@@ -111,7 +111,11 @@ export const createServiceRecord = async (record: ServiceRecord): Promise<ApiRes
       await logCreditChange(
         volunteer.id,
         creditResult.changeAmount,
-        record.is_no_show ? '服务爽约-信用分重算' : `完成服务-信用分重算: ${record.service_type}`,
+        isNoShow
+          ? '服务爽约-信用分重算'
+          : cap.status === 'overtime'
+            ? `完成服务（超额不计信用）-信用分重算: ${record.service_type}`
+            : `完成服务-信用分重算: ${record.service_type}`,
         creditResult.beforeScore,
         creditResult.afterScore,
         newRecord.id,
@@ -119,18 +123,39 @@ export const createServiceRecord = async (record: ServiceRecord): Promise<ApiRes
       );
     }
 
+    const dayTotalsResult = await client.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN status = 'valid' THEN valid_hours ELSE 0 END), 0) as day_valid_hours,
+         COALESCE(SUM(CASE WHEN status IN ('valid', 'overtime') THEN overtime_hours ELSE 0 END), 0) as day_overtime_hours
+       FROM service_records
+       WHERE volunteer_id = $1
+         AND is_no_show = false
+         AND status <> 'revoked'
+         AND recorded_at::date = $2::date`,
+      [volunteer.id, recordDate]
+    );
+
     return {
       success: true,
       data: {
         record: newRecord,
         pointsChange,
-        newTotalPoints,
-        newLevel,
-        newBadges,
-        levelUp: newLevel > oldLevel,
+        newTotalPoints: aggregates?.totalPoints ?? volunteer.total_points,
+        newLevel: aggregates?.level ?? volunteer.level,
+        newBadges: aggregates?.badgesAwarded ?? [],
+        levelUp: (aggregates?.level ?? volunteer.level) > volunteer.level,
         creditScore: creditResult ? creditResult.afterScore : volunteer.credit_score,
         creditChange: creditResult ? creditResult.changeAmount : 0,
         creditBreakdown: creditResult?.breakdown,
+        validHours: cap.validHours,
+        overtimeHours: cap.overtimeHours,
+        isOvertime: cap.overtimeHours > 0,
+        dailyCap: {
+          recordDate,
+          dailyLimit: DAILY_VALID_HOURS_LIMIT,
+          dayValidHours: round2(Number(dayTotalsResult.rows[0].day_valid_hours)),
+          dayOvertimeHours: round2(Number(dayTotalsResult.rows[0].day_overtime_hours)),
+        },
       },
     };
   } catch (error) {
@@ -148,11 +173,13 @@ export const batchCreateServiceRecords = async (
   const results: any[] = [];
   let successCount = 0;
   let failCount = 0;
+  let totalOvertimeHours = 0;
 
   for (const record of records) {
     const result = await createServiceRecord(record);
     if (result.success) {
       successCount++;
+      totalOvertimeHours += result.data?.overtimeHours ?? 0;
       results.push(result.data);
     } else {
       failCount++;
@@ -166,6 +193,8 @@ export const batchCreateServiceRecords = async (
       total: records.length,
       successCount,
       failCount,
+      totalOvertimeHours: round2(totalOvertimeHours),
+      dailyValidHoursLimit: DAILY_VALID_HOURS_LIMIT,
       results,
     },
   };
@@ -174,30 +203,74 @@ export const batchCreateServiceRecords = async (
 export const getVolunteerServiceRecords = async (
   volunteerId: string,
   page: number = 1,
-  pageSize: number = 20
+  pageSize: number = 20,
+  filters: { status?: string; recordDate?: string } = {}
 ): Promise<ApiResponse<any>> => {
   const client = await pool.connect();
 
   try {
-    const offset = (page - 1) * pageSize;
+    const conditions = ['volunteer_id = $1'];
+    const params: any[] = [volunteerId];
+
+    if (filters.status) {
+      params.push(filters.status);
+      conditions.push(`status = $${params.length}`);
+    }
+    if (filters.recordDate) {
+      params.push(filters.recordDate);
+      conditions.push(`recorded_at::date = $${params.length}::date`);
+    }
+
+    const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
     const countResult = await client.query(
-      'SELECT COUNT(*) as total FROM service_records WHERE volunteer_id = $1',
-      [volunteerId]
+      `SELECT COUNT(*) as total FROM service_records ${whereClause}`,
+      params
     );
 
+    const offset = (page - 1) * pageSize;
     const recordsResult = await client.query(
       `SELECT * FROM service_records
-       WHERE volunteer_id = $1
-       ORDER BY recorded_at DESC
-       LIMIT $2 OFFSET $3`,
-      [volunteerId, pageSize, offset]
+       ${whereClause}
+       ORDER BY recorded_at DESC, cap_seq DESC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, pageSize, offset]
     );
+
+    const totalsResult = await client.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN status = 'valid' THEN valid_hours ELSE 0 END), 0) as total_valid_hours,
+         COALESCE(SUM(CASE WHEN status IN ('valid', 'overtime') THEN overtime_hours ELSE 0 END), 0) as total_overtime_hours,
+         COALESCE(SUM(CASE WHEN status = 'revoked' THEN duration_hours ELSE 0 END), 0) as total_revoked_hours,
+         COUNT(CASE WHEN status = 'valid' THEN 1 END) as valid_count,
+         COUNT(CASE WHEN status = 'overtime' THEN 1 END) as overtime_count,
+         COUNT(CASE WHEN status = 'no_show' THEN 1 END) as no_show_count,
+         COUNT(CASE WHEN status = 'revoked' THEN 1 END) as revoked_count
+       FROM service_records
+       WHERE volunteer_id = $1`,
+      [volunteerId]
+    );
+    const totals = totalsResult.rows[0];
+
+    const dailyCap = await getVolunteerDayCapSummary(client, volunteerId);
 
     return {
       success: true,
       data: {
         records: recordsResult.rows,
+        totals: {
+          total_valid_hours: round2(Number(totals.total_valid_hours)),
+          total_overtime_hours: round2(Number(totals.total_overtime_hours)),
+          total_revoked_hours: round2(Number(totals.total_revoked_hours)),
+          valid_count: Number(totals.valid_count),
+          overtime_count: Number(totals.overtime_count),
+          no_show_count: Number(totals.no_show_count),
+          revoked_count: Number(totals.revoked_count),
+        },
+        daily_cap: {
+          daily_limit: dailyCap.dailyLimit,
+          days: dailyCap.days,
+        },
         pagination: {
           page,
           page_size: pageSize,
@@ -226,12 +299,42 @@ export const getServiceRecordById = async (
       return { success: false, error: messages.volunteers.serviceRecordNotFound };
     }
 
-    return { success: true, data: result.rows[0] };
+    const record = result.rows[0] as ServiceRecord;
+
+    const dayResult = await client.query(
+      `SELECT
+         COALESCE(SUM(valid_hours), 0) as day_valid_hours,
+         COALESCE(SUM(overtime_hours), 0) as day_overtime_hours
+       FROM service_records
+       WHERE volunteer_id = $1
+         AND is_no_show = false
+         AND status <> 'revoked'
+         AND recorded_at::date = $2::date`,
+      [record.volunteer_id, toRecordDate(record.recorded_at)]
+    );
+
+    return {
+      success: true,
+      data: {
+        ...record,
+        daily_cap: {
+          record_date: toRecordDate(record.recorded_at),
+          daily_limit: DAILY_VALID_HOURS_LIMIT,
+          day_valid_hours: round2(Number(dayResult.rows[0].day_valid_hours)),
+          day_overtime_hours: round2(Number(dayResult.rows[0].day_overtime_hours)),
+        },
+      },
+    };
   } finally {
     client.release();
   }
 };
 
+/**
+ * 撤销服务记录（保留原记录，标记为 revoked）：
+ * 撤销后按当天记录顺序把释放出的工时额度补回后续记录，
+ * 并重算积分、等级、徽章、服务次数与信用分。
+ */
 export const deleteServiceRecord = async (
   recordId: string,
   adminId: string,
@@ -243,7 +346,7 @@ export const deleteServiceRecord = async (
     await client.query('BEGIN');
 
     const recordResult = await client.query(
-      'SELECT * FROM service_records WHERE id = $1',
+      'SELECT * FROM service_records WHERE id = $1 FOR UPDATE',
       [recordId]
     );
 
@@ -254,37 +357,73 @@ export const deleteServiceRecord = async (
 
     const record = recordResult.rows[0] as ServiceRecord;
 
-    const volunteerResult = await client.query(
-      'SELECT * FROM volunteers WHERE id = $1',
+    if (record.status === 'revoked') {
+      await client.query('ROLLBACK');
+      return { success: false, error: messages.volunteers.serviceRecordAlreadyRevoked };
+    }
+
+    await client.query(
+      'SELECT * FROM volunteers WHERE id = $1 FOR UPDATE',
       [record.volunteer_id]
     );
 
-    if (volunteerResult.rows.length > 0) {
-      const volunteer = volunteerResult.rows[0] as Volunteer;
-      const pointsToDeduct = record.points_earned || 0;
-      const newTotalPoints = Math.max(0, volunteer.total_points - pointsToDeduct);
-      const newLevel = calculateLevel(newTotalPoints);
-
-      await client.query(
-        `UPDATE volunteers
-         SET total_points = $1, level = $2, service_count = GREATEST(0, service_count - 1)
-         WHERE id = $3`,
-        [newTotalPoints, newLevel, volunteer.id]
-      );
-
-      await client.query(
-        `INSERT INTO points_logs (volunteer_id, change_amount, reason, before_points, after_points, related_id, related_type)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [volunteer.id, -pointsToDeduct, `管理员删除记录: ${reason}`, volunteer.total_points, newTotalPoints, recordId, 'admin_delete']
-      );
-    }
-
-    await client.query('DELETE FROM service_records WHERE id = $1', [recordId]);
+    const recordDate = toRecordDate(record.recorded_at);
 
     await client.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, old_value, reason)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [adminId, 'delete', 'service_record', recordId, record, reason]
+      `UPDATE service_records
+       SET status = 'revoked',
+           revoked_at = CURRENT_TIMESTAMP,
+           revoked_by = $1,
+           revoke_reason = $2
+       WHERE id = $3`,
+      [adminId, reason, recordId]
+    );
+
+    // 按当天顺序重算有效/超额工时，后续记录的有效工时自动补回
+    const changes = await reallocateVolunteerDays(client, record.volunteer_id, [recordDate]);
+    await rebuildServicePointsLogs(client, record.volunteer_id);
+    const aggregates = await reconcileVolunteerAggregates(client, record.volunteer_id);
+
+    const restoredRecords = changes
+      .filter((change: RecordCapChange) => change.after.valid_hours > change.before.valid_hours)
+      .map((change: RecordCapChange) => ({
+        id: change.record.id,
+        service_type: change.record.service_type,
+        recorded_at: change.record.recorded_at,
+        duration_hours: Number(change.record.duration_hours),
+        valid_hours_before: change.before.valid_hours,
+        valid_hours_after: change.after.valid_hours,
+        overtime_hours_before: change.before.overtime_hours,
+        overtime_hours_after: change.after.overtime_hours,
+        points_before: change.before.points_earned,
+        points_after: change.after.points_earned,
+        status_before: change.before.status,
+        status_after: change.after.status,
+      }));
+
+    const restoredHours = round2(
+      restoredRecords.reduce(
+        (sum, item) => sum + (item.valid_hours_after - item.valid_hours_before),
+        0
+      )
+    );
+
+    await client.query(
+      `INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, old_value, new_value, reason)
+       VALUES ($1, 'revoke', 'service_record', $2, $3, $4, $5)`,
+      [
+        adminId,
+        recordId,
+        record,
+        {
+          status: 'revoked',
+          record_date: recordDate,
+          restored_records: restoredRecords,
+          restored_hours: restoredHours,
+          aggregates,
+        },
+        reason,
+      ]
     );
 
     await client.query('COMMIT');
@@ -294,22 +433,33 @@ export const deleteServiceRecord = async (
       await logCreditChange(
         record.volunteer_id,
         creditResult.changeAmount,
-        '删除服务记录-信用分重算',
+        '撤销服务记录-信用分重算',
         creditResult.beforeScore,
         creditResult.afterScore,
         recordId,
-        'admin_delete'
+        'admin_revoke'
       );
     }
 
     return {
       success: true,
-      message: messages.volunteers.serviceRecordDeleted,
-      data: creditResult ? {
-        creditScore: creditResult.afterScore,
-        creditChange: creditResult.changeAmount,
-        creditBreakdown: creditResult.breakdown,
-      } : undefined,
+      message: messages.volunteers.serviceRecordRevoked,
+      data: {
+        record_id: recordId,
+        record_date: recordDate,
+        recalculation: {
+          restored_hours: restoredHours,
+          restored_records: restoredRecords,
+          total_points: aggregates?.totalPoints,
+          level: aggregates?.level,
+          service_count: aggregates?.serviceCount,
+          badges_awarded: aggregates?.badgesAwarded ?? [],
+          badges_revoked: aggregates?.badgesRevoked ?? [],
+        },
+        creditScore: creditResult?.afterScore,
+        creditChange: creditResult?.changeAmount,
+        creditBreakdown: creditResult?.breakdown,
+      },
     };
   } catch (error) {
     await client.query('ROLLBACK');

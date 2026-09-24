@@ -41,7 +41,9 @@ export const messages = {
     serviceRecordCreateFailed: '创建服务记录失败',
     serviceRecordNotFound: '记录不存在',
     serviceRecordDeleted: '记录已删除',
-    serviceRecordDeleteFailed: '删除记录失败',
+    serviceRecordRevoked: '记录已撤销，后续有效工时已按当天顺序补回',
+    serviceRecordAlreadyRevoked: '该记录已撤销，不能重复撤销',
+    serviceRecordDeleteFailed: '撤销记录失败',
   },
   complaints: {
     notFound: '投诉不存在',

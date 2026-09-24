@@ -43,6 +43,7 @@ app.get('/api/v1/service-types', (req: Request, res: Response) => {
       badgeLevels,
       pointsPerHour: serviceRules.pointsPerHour,
       creditLimitThreshold: serviceRules.creditLimitThreshold,
+      dailyValidHoursLimit: serviceRules.dailyValidHoursLimit,
     },
   });
 });

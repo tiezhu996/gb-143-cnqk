@@ -141,14 +141,15 @@ export const getTrendData = async (
       )
       SELECT
         ds.date::text,
-        COALESCE(SUM(sr.points_earned), 0) as total_points,
-        COUNT(sr.id) FILTER (WHERE sr.is_no_show = false) as total_services,
+        COALESCE(SUM(CASE WHEN sr.status = 'valid' THEN sr.points_earned ELSE 0 END), 0) as total_points,
+        COUNT(CASE WHEN sr.status = 'valid' THEN 1 END) as total_services,
         COALESCE(
           (SELECT AVG(v.credit_score) FROM volunteers v),
           0
         ) as average_credit
       FROM date_series ds
-      LEFT JOIN service_records sr ON sr.recorded_at::date = ds.date
+      LEFT JOIN service_records sr
+        ON sr.recorded_at::date = ds.date AND sr.status IN ('valid', 'overtime', 'no_show')
       GROUP BY ds.date
       ORDER BY ds.date`,
       [startDate, endDate]
@@ -179,10 +180,12 @@ export const getStatsOverview = async (): Promise<ApiResponse<any>> => {
 
     const serviceStats = await client.query(
       `SELECT
-        COUNT(*) as total_services,
-        COALESCE(SUM(duration_hours) FILTER (WHERE is_no_show = false), 0) as total_hours,
-        COALESCE(AVG(rating) FILTER (WHERE rating > 0), 0) as avg_rating,
-        COUNT(*) FILTER (WHERE is_no_show = true) as total_no_shows
+        COUNT(CASE WHEN status IN ('valid', 'overtime', 'no_show') THEN 1 END) as total_services,
+        COALESCE(SUM(CASE WHEN status = 'valid' THEN valid_hours ELSE 0 END), 0) as total_hours,
+        COALESCE(SUM(CASE WHEN status IN ('valid', 'overtime') THEN overtime_hours ELSE 0 END), 0) as total_overtime_hours,
+        COALESCE(AVG(CASE WHEN status = 'valid' THEN rating END), 0) as avg_rating,
+        COUNT(CASE WHEN status = 'no_show' THEN 1 END) as total_no_shows,
+        COUNT(CASE WHEN status = 'revoked' THEN 1 END) as total_revoked
        FROM service_records`
     );
 
@@ -201,6 +204,7 @@ export const getStatsOverview = async (): Promise<ApiResponse<any>> => {
         services: {
           ...serviceStats.rows[0],
           total_hours: parseFloat(serviceStats.rows[0].total_hours),
+          total_overtime_hours: parseFloat(serviceStats.rows[0].total_overtime_hours),
           avg_rating: parseFloat(serviceStats.rows[0].avg_rating),
         },
         complaints: complaintStats.rows[0],

@@ -262,10 +262,12 @@ export const getVolunteerSummary = async (
 
     const statsResult = await client.query(
       `SELECT
-        COUNT(*) as total_services,
-        COALESCE(SUM(CASE WHEN is_no_show = false THEN duration_hours ELSE 0 END), 0) as total_hours,
-        COALESCE(AVG(CASE WHEN rating > 0 THEN rating END), 0) as avg_rating,
-        COALESCE(SUM(CASE WHEN is_no_show = true THEN 1 ELSE 0 END), 0) as no_show_count
+        COUNT(CASE WHEN status IN ('valid', 'overtime', 'no_show') THEN 1 END) as total_services,
+        COALESCE(SUM(CASE WHEN status = 'valid' THEN valid_hours ELSE 0 END), 0) as total_hours,
+        COALESCE(SUM(CASE WHEN status IN ('valid', 'overtime') THEN overtime_hours ELSE 0 END), 0) as total_overtime_hours,
+        COALESCE(AVG(CASE WHEN status = 'valid' THEN rating END), 0) as avg_rating,
+        COUNT(CASE WHEN status = 'no_show' THEN 1 END) as no_show_count,
+        COUNT(CASE WHEN status = 'revoked' THEN 1 END) as revoked_count
        FROM service_records WHERE volunteer_id = $1`,
       [volunteerId]
     );
@@ -283,6 +285,7 @@ export const getVolunteerSummary = async (
         statistics: {
           ...statsResult.rows[0],
           total_hours: parseFloat(statsResult.rows[0].total_hours),
+          total_overtime_hours: parseFloat(statsResult.rows[0].total_overtime_hours),
           avg_rating: parseFloat(statsResult.rows[0].avg_rating),
         },
         complaints: complaintsResult.rows[0],

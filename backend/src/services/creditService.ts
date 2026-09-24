@@ -49,7 +49,9 @@ export const recalculateCreditScore = async (
     const beforeScore = volunteer.credit_score;
 
     const servicesResult = await client.query(
-      'SELECT * FROM service_records WHERE volunteer_id = $1 ORDER BY recorded_at DESC LIMIT 50',
+      `SELECT * FROM service_records
+       WHERE volunteer_id = $1 AND status IN ('valid', 'no_show')
+       ORDER BY recorded_at DESC LIMIT 50`,
       [volunteerId]
     );
     const recentServices = servicesResult.rows as ServiceRecord[];
@@ -61,10 +63,15 @@ export const recalculateCreditScore = async (
     const recentComplaints = complaintsResult.rows as Complaint[];
 
     const noShowResult = await client.query(
-      'SELECT COUNT(*) as count FROM service_records WHERE volunteer_id = $1 AND is_no_show = true',
+      `SELECT COUNT(*) as count
+       FROM service_records
+       WHERE volunteer_id = $1 AND is_no_show = true AND status = 'no_show'`,
       [volunteerId]
     );
     const noShowCount = parseInt(noShowResult.rows[0].count);
+
+    // 评分只统计有效服务（撤销、爽约、超额整单不参与）
+    const ratingRecords = recentServices.filter(s => !s.is_no_show && s.status === 'valid');
 
     let score = 100;
 
@@ -72,8 +79,8 @@ export const recalculateCreditScore = async (
     score += serviceCountBonus;
 
     let averageRating = 0;
-    if (recentServices.length > 0) {
-      averageRating = recentServices.reduce((sum, s) => sum + s.rating, 0) / recentServices.length;
+    if (ratingRecords.length > 0) {
+      averageRating = ratingRecords.reduce((sum, s) => sum + s.rating, 0) / ratingRecords.length;
       const ratingBonus = (averageRating - 3) * 15;
       score += ratingBonus;
     }
@@ -89,15 +96,16 @@ export const recalculateCreditScore = async (
     const breakdown = {
       baseScore: 100,
       serviceCountBonus: Math.min(volunteer.service_count * 0.5, 10),
-      ratingBonus: recentServices.length > 0 ? (averageRating - 3) * 15 : 0,
+      ratingBonus: ratingRecords.length > 0 ? (averageRating - 3) * 15 : 0,
       noShowPenalty: -noShowCount * 20,
       complaintPenalty: -activeComplaintCount * 15,
       total: afterScore,
       details: {
         serviceCount: volunteer.service_count,
         serviceCountBonus: Math.min(volunteer.service_count * 0.5, 10),
-        avgRating: recentServices.length > 0 ? Math.round(averageRating * 100) / 100 : null,
-        ratingBonus: recentServices.length > 0 ? (averageRating - 3) * 15 : 0,
+        avgRating: ratingRecords.length > 0 ? Math.round(averageRating * 100) / 100 : null,
+        ratingBonus: ratingRecords.length > 0 ? (averageRating - 3) * 15 : 0,
+        validRatingCount: ratingRecords.length,
         noShowCount,
         noShowPenalty: -noShowCount * 20,
         activeComplaintCount,

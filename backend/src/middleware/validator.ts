@@ -102,6 +102,13 @@ export const paginationSchema = Joi.object({
   search: Joi.string().optional(),
 });
 
+export const serviceRecordsQuerySchema = Joi.object({
+  page: Joi.number().integer().min(1).default(1),
+  page_size: Joi.number().integer().min(1).max(100).default(20),
+  status: Joi.string().valid('valid', 'overtime', 'no_show', 'revoked').optional(),
+  record_date: Joi.date().optional(),
+});
+
 export const trendSchema = Joi.object({
   start_date: Joi.date().required(),
   end_date: Joi.date().required(),

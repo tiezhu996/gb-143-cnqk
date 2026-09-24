@@ -42,6 +42,8 @@ export const BADGE_DESCRIPTIONS: Record<number, string> = {
   5: '卓越志愿者，公益楷模',
 };
 
+export type ServiceRecordStatus = 'valid' | 'overtime' | 'no_show' | 'revoked';
+
 export interface ServiceRecord {
   id?: string;
   volunteer_id: string;
@@ -53,6 +55,13 @@ export interface ServiceRecord {
   location?: string;
   description?: string;
   recorded_at?: Date;
+  valid_hours?: number;
+  overtime_hours?: number;
+  cap_seq?: string;
+  status?: ServiceRecordStatus;
+  revoked_at?: Date | null;
+  revoked_by?: string | null;
+  revoke_reason?: string | null;
   created_at?: Date;
   updated_at?: Date;
 }
@@ -161,6 +170,15 @@ export interface CreateServiceRecordResult {
   creditScore: number;
   creditChange: number;
   creditBreakdown?: CreditCalculationBreakdown;
+  validHours: number;
+  overtimeHours: number;
+  isOvertime: boolean;
+  dailyCap: {
+    recordDate: string;
+    dailyLimit: number;
+    dayValidHours: number;
+    dayOvertimeHours: number;
+  };
 }
 
 export interface ComplaintWithCredit extends Complaint {
