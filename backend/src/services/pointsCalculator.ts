@@ -17,6 +17,21 @@ export const calculatePoints = (
   return Math.max(1, finalPoints);
 };
 
+export const calculatePointsForValidHours = (
+  validHours: number,
+  serviceType: string,
+  rating: number
+): number => {
+  if (validHours <= 0) {
+    return 0;
+  }
+  return calculatePoints(validHours, serviceType, rating);
+};
+
+export const roundHours = (hours: number): number => {
+  return Math.round(hours * 100) / 100;
+};
+
 export const calculateNoShowPenalty = (): number => {
   return 20;
 };

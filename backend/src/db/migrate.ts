@@ -11,6 +11,14 @@ const createTables = async (): Promise<void> => {
     await client.query('CREATE EXTENSION IF NOT EXISTS "pgcrypto"');
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS app_metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS volunteers (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         name VARCHAR(100) NOT NULL,
@@ -36,8 +44,18 @@ const createTables = async (): Promise<void> => {
         service_type VARCHAR(50) NOT NULL,
         duration_hours DECIMAL(6,2) NOT NULL,
         rating INTEGER NOT NULL DEFAULT 5 CHECK (rating >= 1 AND rating <= 5),
+        valid_hours DECIMAL(6,2) NOT NULL DEFAULT 0,
+        overtime_hours DECIMAL(6,2) NOT NULL DEFAULT 0,
+        is_overtime BOOLEAN NOT NULL DEFAULT false,
+        status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
         points_earned INTEGER NOT NULL DEFAULT 0,
+        points_adjustment INTEGER NOT NULL DEFAULT 0,
         is_no_show BOOLEAN NOT NULL DEFAULT false,
+        entry_seq INTEGER NOT NULL DEFAULT 1,
+        revoked_at TIMESTAMP,
+        revoked_by VARCHAR(100),
+        revoke_reason TEXT,
+        recalculated_at TIMESTAMP,
         location VARCHAR(200),
         description TEXT,
         recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -48,6 +66,72 @@ const createTables = async (): Promise<void> => {
       CREATE INDEX IF NOT EXISTS idx_service_records_volunteer_id ON service_records(volunteer_id);
       CREATE INDEX IF NOT EXISTS idx_service_records_recorded_at ON service_records(recorded_at DESC);
       CREATE INDEX IF NOT EXISTS idx_service_records_service_type ON service_records(service_type);
+      CREATE INDEX IF NOT EXISTS idx_service_records_status ON service_records(status);
+      CREATE INDEX IF NOT EXISTS idx_service_records_volunteer_day
+        ON service_records(volunteer_id, (recorded_at::date), entry_seq)
+        WHERE status = 'active';
+    `);
+
+    // 旧库升级：补齐每日上限相关列（幂等）
+    const addColumnIfMissing = async (column: string, definition: string): Promise<void> => {
+      const exists = await client.query(
+        `SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'service_records' AND column_name = $1`,
+        [column]
+      );
+      if (exists.rows.length === 0) {
+        await client.query(`ALTER TABLE service_records ADD COLUMN ${column} ${definition}`);
+      }
+    };
+
+    await addColumnIfMissing('valid_hours', "DECIMAL(6,2) NOT NULL DEFAULT 0");
+    await addColumnIfMissing('overtime_hours', "DECIMAL(6,2) NOT NULL DEFAULT 0");
+    await addColumnIfMissing('is_overtime', 'BOOLEAN NOT NULL DEFAULT false');
+    await addColumnIfMissing("status", "VARCHAR(20) NOT NULL DEFAULT 'active'");
+    await addColumnIfMissing('points_adjustment', 'INTEGER NOT NULL DEFAULT 0');
+    await addColumnIfMissing('entry_seq', 'INTEGER NOT NULL DEFAULT 1');
+    await addColumnIfMissing('revoked_at', 'TIMESTAMP');
+    await addColumnIfMissing('revoked_by', 'VARCHAR(100)');
+    await addColumnIfMissing('revoke_reason', 'TEXT');
+    await addColumnIfMissing('recalculated_at', 'TIMESTAMP');
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'service_records_status_check'
+        ) THEN
+          ALTER TABLE service_records
+            ADD CONSTRAINT service_records_status_check
+            CHECK (status IN ('active', 'revoked'));
+        END IF;
+      END $$;
+    `);
+
+    // 旧数据补编号：按 志愿者 + 记录日期 + 入库时间 顺序补齐 entry_seq
+    await client.query(`
+      UPDATE service_records sr
+      SET entry_seq = sub.seq
+      FROM (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY volunteer_id, recorded_at::date
+                 ORDER BY created_at ASC
+               ) AS seq
+        FROM service_records
+      ) sub
+      WHERE sr.id = sub.id AND sr.entry_seq = 1
+        AND EXISTS (
+          SELECT 1 FROM service_records s2
+          WHERE s2.volunteer_id = sr.volunteer_id
+            AND s2.recorded_at::date = sr.recorded_at::date
+            AND s2.id <> sr.id
+        );
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_service_records_volunteer_day_seq
+        ON service_records(volunteer_id, (recorded_at::date), entry_seq);
     `);
 
     await client.query(`

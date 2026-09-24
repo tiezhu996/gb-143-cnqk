@@ -64,12 +64,19 @@ const runTests = async (): Promise<void> => {
     console.log('========================================');
 
     console.log('\n--- 用例1.1: 完成服务后服务次数增加 ---');
+    // 不同记录日期，避免每日8小时上限影响信用分用例
+    const dayDate = (offset: number): Date => {
+      const d = new Date('2026-01-01T09:00:00Z');
+      d.setUTCDate(d.getUTCDate() + offset);
+      return d;
+    };
     const service1 = await createServiceRecord({
       volunteer_id: volunteerId,
       service_type: 'community_service',
       duration_hours: 2,
       rating: 5,
       description: '信用分测试-服务1',
+      recorded_at: dayDate(0) as any,
     });
     assert('服务记录创建成功', service1.success === true, '服务记录创建失败', service1);
 
@@ -90,6 +97,7 @@ const runTests = async (): Promise<void> => {
         duration_hours: 1,
         rating: 3,
         description: `信用分测试-批量服务${i}`,
+        recorded_at: dayDate(i + 100) as any,
       });
     }
 
@@ -108,6 +116,7 @@ const runTests = async (): Promise<void> => {
       duration_hours: 3,
       rating: 5,
       description: '信用分测试-高评分',
+      recorded_at: dayDate(200) as any,
     });
     assert('高评分服务创建成功', highRatingService.success === true, '高评分服务创建失败', highRatingService);
 
@@ -119,12 +128,18 @@ const runTests = async (): Promise<void> => {
       '应返回信用分计算分解', highRatingService.data?.creditBreakdown);
 
     console.log('\n--- 用例2.2: 低评分服务降低信用分 ---');
+    // 独立志愿者，避免大量历史评分稀释均值
+    const lowRatingVolunteerResult = await createVolunteer('信用分测试-低评分', '13900000005', 'lowrating-test@example.com');
+    const lowRatingVolunteerId = lowRatingVolunteerResult.data?.id;
+    assert('低评分志愿者创建成功', !!lowRatingVolunteerId, '创建失败', lowRatingVolunteerResult);
+
     const lowRatingService = await createServiceRecord({
-      volunteer_id: volunteerId,
+      volunteer_id: lowRatingVolunteerId!,
       service_type: 'community_service',
       duration_hours: 2,
       rating: 1,
       description: '信用分测试-低评分',
+      recorded_at: dayDate(300) as any,
     });
     assert('低评分服务创建成功', lowRatingService.success === true, '低评分服务创建失败', lowRatingService);
 
@@ -149,6 +164,7 @@ const runTests = async (): Promise<void> => {
         rating: 3,
         is_no_show: true,
         description: '信用分测试-爽约',
+        recorded_at: new Date('2026-03-01T09:00:00Z') as any,
       });
       assert('爽约服务记录创建成功', noShowService.success === true, '爽约服务创建失败', noShowService);
 
@@ -208,7 +224,7 @@ const runTests = async (): Promise<void> => {
 
       console.log('\n--- 用例4.3: 处理投诉(驳回)后信用分恢复 ---');
       const handleReject = await handleComplaint(
-        complaint1.data?.id!,
+        complaint1.data!.id,
         'reject',
         'test-admin',
         '投诉不成立，测试驳回'
@@ -230,7 +246,7 @@ const runTests = async (): Promise<void> => {
       assert('第二个投诉创建成功', complaint2.success === true, '第二个投诉创建失败', complaint2);
 
       const handleResolve = await handleComplaint(
-        complaint2.data?.id!,
+        complaint2.data!.id,
         'resolve',
         'test-admin',
         '投诉成立，扣除积分和信用分',

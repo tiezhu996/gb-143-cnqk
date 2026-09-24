@@ -40,8 +40,9 @@ export const messages = {
       `当前信用分为 ${creditScore} 分，低于 ${threshold} 分的限制线，请联系管理员处理`,
     serviceRecordCreateFailed: '创建服务记录失败',
     serviceRecordNotFound: '记录不存在',
-    serviceRecordDeleted: '记录已删除',
-    serviceRecordDeleteFailed: '删除记录失败',
+    serviceRecordAlreadyRevoked: '该记录已被撤销，无需重复操作',
+    serviceRecordDeleted: '记录已撤销，后续记录有效工时已补回',
+    serviceRecordDeleteFailed: '撤销记录失败',
   },
   complaints: {
     notFound: '投诉不存在',

@@ -45,7 +45,8 @@ router.get('/volunteer/:volunteerId', validateQuery(paginationSchema), async (re
   try {
     const page = parseInt(req.query.page as string) || 1;
     const pageSize = parseInt(req.query.page_size as string) || 20;
-    const result = await getVolunteerServiceRecords(req.params.volunteerId, page, pageSize);
+    const status = req.query.status as string | undefined;
+    const result = await getVolunteerServiceRecords(req.params.volunteerId, page, pageSize, status);
     res.status(200).json(result);
   } catch (error) {
     sendInternalError(res, error, 'Error getting volunteer service records');
@@ -55,12 +56,12 @@ router.get('/volunteer/:volunteerId', validateQuery(paginationSchema), async (re
 router.delete('/:id', async (req: AuthRequest, res: Response) => {
   try {
     const adminId = req.user?.id || 'anonymous';
-    const reason = req.query.reason as string || '管理员删除';
+    const reason = (req.query.reason as string) || (req.body?.reason as string) || '管理员撤销记录';
     const result = await deleteServiceRecord(req.params.id, adminId, reason);
     const statusCode = result.success ? 200 : 400;
     res.status(statusCode).json(result);
   } catch (error) {
-    sendInternalError(res, error, 'Error deleting service record');
+    sendInternalError(res, error, 'Error revoking service record');
   }
 });
 

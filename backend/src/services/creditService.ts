@@ -48,8 +48,14 @@ export const recalculateCreditScore = async (
     const volunteer = volunteerResult.rows[0] as Volunteer;
     const beforeScore = volunteer.credit_score;
 
+    // 信用评价只看有效（active）记录；整条超额（valid_hours=0）的记录不参与评分均值
     const servicesResult = await client.query(
-      'SELECT * FROM service_records WHERE volunteer_id = $1 ORDER BY recorded_at DESC LIMIT 50',
+      `SELECT * FROM service_records
+       WHERE volunteer_id = $1
+         AND status = 'active'
+         AND is_no_show = false
+         AND valid_hours > 0
+       ORDER BY recorded_at DESC LIMIT 50`,
       [volunteerId]
     );
     const recentServices = servicesResult.rows as ServiceRecord[];
@@ -61,7 +67,9 @@ export const recalculateCreditScore = async (
     const recentComplaints = complaintsResult.rows as Complaint[];
 
     const noShowResult = await client.query(
-      'SELECT COUNT(*) as count FROM service_records WHERE volunteer_id = $1 AND is_no_show = true',
+      `SELECT COUNT(*) as count
+       FROM service_records
+       WHERE volunteer_id = $1 AND status = 'active' AND is_no_show = true`,
       [volunteerId]
     );
     const noShowCount = parseInt(noShowResult.rows[0].count);

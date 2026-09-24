@@ -262,10 +262,14 @@ export const getVolunteerSummary = async (
 
     const statsResult = await client.query(
       `SELECT
-        COUNT(*) as total_services,
-        COALESCE(SUM(CASE WHEN is_no_show = false THEN duration_hours ELSE 0 END), 0) as total_hours,
-        COALESCE(AVG(CASE WHEN rating > 0 THEN rating END), 0) as avg_rating,
-        COALESCE(SUM(CASE WHEN is_no_show = true THEN 1 ELSE 0 END), 0) as no_show_count
+        COUNT(*) FILTER (WHERE status = 'active') as total_services,
+        COUNT(*) FILTER (WHERE status = 'revoked') as revoked_services,
+        COUNT(*) FILTER (WHERE status = 'active' AND is_overtime = true) as overtime_services,
+        COALESCE(SUM(CASE WHEN status = 'active' AND is_no_show = false THEN duration_hours ELSE 0 END), 0) as total_hours,
+        COALESCE(SUM(CASE WHEN status = 'active' THEN valid_hours ELSE 0 END), 0) as total_valid_hours,
+        COALESCE(SUM(CASE WHEN status = 'active' THEN overtime_hours ELSE 0 END), 0) as total_overtime_hours,
+        COALESCE(AVG(CASE WHEN status = 'active' AND is_no_show = false AND valid_hours > 0 THEN rating END), 0) as avg_rating,
+        COALESCE(SUM(CASE WHEN status = 'active' AND is_no_show = true THEN 1 ELSE 0 END), 0) as no_show_count
        FROM service_records WHERE volunteer_id = $1`,
       [volunteerId]
     );
@@ -282,8 +286,15 @@ export const getVolunteerSummary = async (
         badges: badgesResult.rows,
         statistics: {
           ...statsResult.rows[0],
+          total_services: parseInt(statsResult.rows[0].total_services, 10),
+          revoked_services: parseInt(statsResult.rows[0].revoked_services, 10),
+          overtime_services: parseInt(statsResult.rows[0].overtime_services, 10),
+          daily_valid_hours_limit: 8,
           total_hours: parseFloat(statsResult.rows[0].total_hours),
+          total_valid_hours: parseFloat(statsResult.rows[0].total_valid_hours),
+          total_overtime_hours: parseFloat(statsResult.rows[0].total_overtime_hours),
           avg_rating: parseFloat(statsResult.rows[0].avg_rating),
+          no_show_count: parseInt(statsResult.rows[0].no_show_count, 10),
         },
         complaints: complaintsResult.rows[0],
       },

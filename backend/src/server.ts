@@ -3,6 +3,7 @@ import { env } from './config/env';
 import { messages } from './constants/messages';
 import { apiEndpoints } from './constants/serviceConfig';
 import { createTables, seedData } from './db/migrate';
+import { backfillDailyCaps } from './db/backfill';
 import { logger } from './utils/logger';
 
 const startServer = async (): Promise<void> => {
@@ -10,6 +11,7 @@ const startServer = async (): Promise<void> => {
     logger.info(messages.errors.databaseInitializing);
     await createTables();
     await seedData();
+    await backfillDailyCaps();
     logger.info(messages.errors.databaseInitialized);
 
     app.listen(env.port, () => {

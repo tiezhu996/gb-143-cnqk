@@ -18,6 +18,10 @@ export const SERVICE_TYPE_WEIGHTS: ServiceTypeWeight[] = [
 
 export const POINTS_PER_HOUR = 10;
 
+export const DAILY_VALID_HOURS_LIMIT = 8;
+
+export type ServiceRecordStatus = 'active' | 'revoked';
+
 export const LEVEL_THRESHOLDS: Record<number, number> = {
   1: 0,
   2: 100,
@@ -47,8 +51,18 @@ export interface ServiceRecord {
   volunteer_id: string;
   service_type: string;
   duration_hours: number;
+  valid_hours?: number;
+  overtime_hours?: number;
+  is_overtime?: boolean;
+  status?: ServiceRecordStatus;
+  revoked_at?: Date;
+  revoked_by?: string;
+  revoke_reason?: string;
+  recalculated_at?: Date;
+  entry_seq?: number;
   rating: number;
   points_earned?: number;
+  points_adjustment?: number;
   is_no_show?: boolean;
   location?: string;
   description?: string;
@@ -151,6 +165,44 @@ export interface ServiceRecordWithCredit extends ServiceRecord {
   creditBreakdown?: CreditCalculationBreakdown;
 }
 
+export interface DailyCapRecomputeResult {
+  updatedRecordIds: string[];
+  recordChanges: RecordPointsChange[];
+  totalPointsChange: number;
+  effectivePointsTotal: number;
+  noShowPenaltyTotal: number;
+}
+
+export interface RecordPointsChange {
+  record_id: string;
+  service_date: string;
+  old_points: number;
+  new_points: number;
+  old_valid_hours: number;
+  new_valid_hours: number;
+  old_overtime_hours: number;
+  new_overtime_hours: number;
+  points_change: number;
+  entry_seq?: number;
+  log_reason?: string;
+}
+
+export interface VolunteerRebuildResult {
+  oldTotalPoints: number;
+  newTotalPoints: number;
+  pointsChange: number;
+  oldLevel: number;
+  newLevel: number;
+  oldServiceCount: number;
+  newServiceCount: number;
+  newBadges: Badge[];
+  removedBadgeLevels: number[];
+  effectivePointsTotal: number;
+  noShowPenaltyTotal: number;
+  recordChanges: RecordPointsChange[];
+  updatedRecordIds: string[];
+}
+
 export interface CreateServiceRecordResult {
   record: ServiceRecord;
   pointsChange: number;
@@ -158,6 +210,32 @@ export interface CreateServiceRecordResult {
   newLevel: number;
   newBadges: any[];
   levelUp: boolean;
+  creditScore: number;
+  creditChange: number;
+  creditBreakdown?: CreditCalculationBreakdown;
+  validHours: number;
+  overtimeHours: number;
+  isOvertime: boolean;
+  dailyLimit: number;
+  recompute?: {
+    recordChanges: RecordPointsChange[];
+    totalPointsChange: number;
+  };
+}
+
+export interface RevokeServiceRecordResult {
+  record: ServiceRecord;
+  oldTotalPoints: number;
+  newTotalPoints: number;
+  pointsChange: number;
+  oldLevel: number;
+  newLevel: number;
+  oldServiceCount: number;
+  newServiceCount: number;
+  newBadges: Badge[];
+  removedBadgeLevels: number[];
+  restoredRecords: RecordPointsChange[];
+  restoredPoints: number;
   creditScore: number;
   creditChange: number;
   creditBreakdown?: CreditCalculationBreakdown;
@@ -199,5 +277,7 @@ export interface TrendData {
   date: string;
   total_points: number;
   total_services: number;
+  total_valid_hours: number;
+  total_overtime_hours: number;
   average_credit: number;
 }

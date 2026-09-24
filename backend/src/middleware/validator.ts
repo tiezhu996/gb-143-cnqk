@@ -100,6 +100,7 @@ export const paginationSchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
   page_size: Joi.number().integer().min(1).max(100).default(20),
   search: Joi.string().optional(),
+  status: Joi.string().valid('active', 'revoked').optional(),
 });
 
 export const trendSchema = Joi.object({
